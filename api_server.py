@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-OpenAI-Compatible Kyutai TTS API Server
-Provides OpenAI Audio Speech API endpoints for text-to-speech generation
+OpenAI-Compatible Kyutai TTS API Server with Model Caching
+Improved version that loads the model once and keeps it in memory
 """
 
 import os
@@ -11,16 +11,25 @@ import asyncio
 import subprocess
 from pathlib import Path
 from typing import Optional, Literal
+import logging
 
 import torch
 import soundfile as sf
-from fastapi import FastAPI, HTTPException, File, UploadFile
+from fastapi import FastAPI, HTTPException
 from fastapi.responses import Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 import uvicorn
 
-# OpenAI-compatible models
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Global model variables - loaded once at startup
+tts_model = None
+device = None
+sample_rate = None
+
 class SpeechRequest(BaseModel):
     model: Literal["tts-1", "tts-1-hd"] = Field("tts-1", description="TTS model to use")
     input: str = Field(..., min_length=1, max_length=4096, description="Text to generate audio for")
@@ -29,9 +38,9 @@ class SpeechRequest(BaseModel):
     speed: Optional[float] = Field(1.0, ge=0.25, le=4.0, description="Speed of generated audio")
 
 app = FastAPI(
-    title="OpenAI-Compatible TTS API",
-    description="OpenAI Audio Speech API compatible endpoint using Kyutai TTS",
-    version="1.0.0"
+    title="OpenAI-Compatible TTS API (Cached)",
+    description="OpenAI Audio Speech API compatible endpoint using Kyutai TTS with model caching",
+    version="2.0.0"
 )
 
 app.add_middleware(
@@ -45,33 +54,27 @@ app.add_middleware(
 OUTPUT_DIR = Path("/app/api_output")
 OUTPUT_DIR.mkdir(exist_ok=True)
 
-# Voice mapping (Kyutai doesn't have multiple voices yet, but we accept OpenAI voice names)
-VOICE_MAPPING = {
-    "alloy": "default",
-    "echo": "default", 
-    "fable": "default",
-    "onyx": "default",
-    "nova": "default",
-    "shimmer": "default"
-}
-
-def generate_audio(text: str, voice: str = "default", speed: float = 1.0) -> Path:
-    """Generate audio using Kyutai TTS (proper Python API)"""
-    timestamp = int(time.time() * 1000)
-    output_path = OUTPUT_DIR / f"speech_{timestamp}.wav"
+def load_tts_model():
+    """Load TTS model once at startup and keep in memory"""
+    global tts_model, device, sample_rate
+    
+    if tts_model is not None:
+        logger.info("TTS model already loaded")
+        return
     
     try:
+        logger.info("🚀 Loading Kyutai TTS model (one-time initialization)...")
+        
         # Import Kyutai TTS modules
         from moshi.models.loaders import CheckpointInfo
-        from moshi.models.tts import DEFAULT_DSM_TTS_REPO, DEFAULT_DSM_TTS_VOICE_REPO, TTSModel
-        import numpy as np
-        import soundfile as sf
+        from moshi.models.tts import DEFAULT_DSM_TTS_REPO, TTSModel
         
-        print("Loading Kyutai TTS model...")
-        
-        # Load the TTS model (following the notebook approach)
-        checkpoint_info = CheckpointInfo.from_hf_repo(DEFAULT_DSM_TTS_REPO)
+        # Set device
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        logger.info(f"Using device: {device}")
+        
+        # Load the TTS model
+        checkpoint_info = CheckpointInfo.from_hf_repo(DEFAULT_DSM_TTS_REPO)
         
         tts_model = TTSModel.from_checkpoint_info(
             checkpoint_info, 
@@ -80,39 +83,61 @@ def generate_audio(text: str, voice: str = "default", speed: float = 1.0) -> Pat
             device=device
         )
         
-        print("Preparing text and voice...")
+        # Get sample rate
+        sample_rate = tts_model.mimi.sample_rate
+        
+        logger.info(f"✅ TTS model loaded successfully!")
+        logger.info(f"   Model: {DEFAULT_DSM_TTS_REPO}")
+        logger.info(f"   Device: {device}")
+        logger.info(f"   Sample Rate: {sample_rate}")
+        
+    except Exception as e:
+        logger.error(f"❌ Failed to load TTS model: {e}")
+        raise
+
+def generate_audio_fast(text: str, voice: str = "alloy", speed: float = 1.0) -> bytes:
+    """Generate audio using cached TTS model"""
+    global tts_model, device, sample_rate
+    
+    if tts_model is None:
+        raise HTTPException(status_code=500, detail="TTS model not loaded")
+    
+    try:
+        logger.info(f"🎵 Generating audio for: '{text[:50]}{'...' if len(text) > 50 else ''}'")
         
         # Prepare the script (text input)
         entries = tts_model.prepare_script([text], padding_between=1)
         
-        # Use default voice or map OpenAI voice names
+        # Voice mapping for OpenAI compatibility
         voice_mapping = {
             "alloy": "expresso/ex03-ex01_happy_001_channel1_334s.wav",
-            "echo": "expresso/ex03-ex01_happy_001_channel1_334s.wav", 
-            "fable": "expresso/ex03-ex01_happy_001_channel1_334s.wav",
-            "onyx": "expresso/ex03-ex01_happy_001_channel1_334s.wav",
-            "nova": "expresso/ex03-ex01_happy_001_channel1_334s.wav",
-            "shimmer": "expresso/ex03-ex01_happy_001_channel1_334s.wav",
-            "default": "expresso/ex03-ex01_happy_001_channel1_334s.wav"
+            "echo": "expresso/ex04-ex01_happy_001_channel1_334s.wav",
+            "fable": "expresso/ex05-ex01_happy_001_channel1_334s.wav", 
+            "onyx": "expresso/ex06-ex01_happy_001_channel1_334s.wav",
+            "nova": "expresso/ex07-ex01_happy_001_channel1_334s.wav",
+            "shimmer": "expresso/ex08-ex01_happy_001_channel1_334s.wav"
         }
         
-        selected_voice = voice_mapping.get(voice, voice_mapping["default"])
-        voice_path = tts_model.get_voice_path(selected_voice)
+        selected_voice = voice_mapping.get(voice, voice_mapping["alloy"])
+        
+        try:
+            voice_path = tts_model.get_voice_path(selected_voice)
+        except:
+            # Fallback to default if voice not found
+            voice_path = tts_model.get_voice_path("expresso/ex03-ex01_happy_001_channel1_334s.wav")
         
         # Prepare condition attributes
         condition_attributes = tts_model.make_condition_attributes(
             [voice_path], cfg_coef=2.0
         )
         
-        print("Generating audio...")
-        
-        # Generate audio (following notebook approach)
+        # Generate audio
         pcms = []
         
         def on_frame(frame):
             if (frame != -1).all():
                 pcm = tts_model.mimi.decode(frame[:, 1:, :]).cpu().numpy()
-                pcms.append(np.clip(pcm[0, 0], -1, 1))
+                pcms.append(torch.clamp(torch.from_numpy(pcm[0, 0]), -1, 1).numpy())
         
         all_entries = [entries]
         all_condition_attributes = [condition_attributes]
@@ -122,87 +147,73 @@ def generate_audio(text: str, voice: str = "default", speed: float = 1.0) -> Pat
         
         # Concatenate all audio frames
         if pcms:
+            import numpy as np
             audio = np.concatenate(pcms, axis=-1)
             
-            # Save as WAV file
-            sf.write(
-                str(output_path), 
-                audio, 
-                samplerate=tts_model.mimi.sample_rate,
-                format='WAV'
-            )
+            # Apply speed adjustment if needed
+            if speed != 1.0:
+                # Simple speed adjustment by resampling
+                from scipy import signal
+                audio_length = len(audio)
+                new_length = int(audio_length / speed)
+                audio = signal.resample(audio, new_length)
             
-            print(f"Audio generated successfully: {output_path}")
-            return output_path
+            # Convert to bytes
+            audio_bytes = io.BytesIO()
+            sf.write(audio_bytes, audio, samplerate=sample_rate, format='WAV')
+            audio_bytes.seek(0)
+            
+            logger.info(f"✅ Audio generated successfully ({len(audio)/sample_rate:.2f}s)")
+            return audio_bytes.read()
         else:
             raise Exception("No audio frames generated")
             
-    except ImportError as e:
-        print(f"Moshi import error: {e}")
-        print("This usually means missing dependencies. Check if moshi and its dependencies are properly installed.")
-        # Fallback to placeholder
-        create_placeholder_audio(output_path, text)
-        return output_path
     except Exception as e:
-        print(f"TTS generation error: {e}")
-        import traceback
-        traceback.print_exc()
-        # Fallback to placeholder  
-        create_placeholder_audio(output_path, text)
-        return output_path
+        logger.error(f"❌ TTS generation error: {e}")
+        raise HTTPException(status_code=500, detail=f"Audio generation failed: {str(e)}")
 
-def create_placeholder_audio(output_path: Path, text: str):
-    """Create placeholder audio when moshi fails"""
-    import wave
-    import numpy as np
-    
-    # Generate simple tone as placeholder
-    sample_rate = 24000
-    duration = max(1.0, len(text) * 0.1)  # Rough estimate
-    t = np.linspace(0, duration, int(sample_rate * duration))
-    
-    # Create a simple beep pattern
-    audio_data = np.sin(2 * np.pi * 440 * t) * 0.3  # 440Hz tone
-    audio_data = (audio_data * 32767).astype(np.int16)
-    
-    with wave.open(str(output_path), 'w') as wav_file:
-        wav_file.setnchannels(1)
-        wav_file.setsampwidth(2)
-        wav_file.setframerate(sample_rate)
-        wav_file.writeframes(audio_data.tobytes())
-
-def convert_audio_format(input_path: Path, output_format: str) -> bytes:
-    """Convert audio to requested format using ffmpeg"""
+def convert_audio_format(audio_wav_bytes: bytes, output_format: str) -> bytes:
+    """Convert WAV audio to requested format using ffmpeg"""
     try:
         if output_format == "wav":
-            with open(input_path, 'rb') as f:
-                return f.read()
-                
-        # Convert using ffmpeg for other formats
-        cmd = ["ffmpeg", "-i", str(input_path), "-f", output_format, "-"]
+            return audio_wav_bytes
+            
+        # Use ffmpeg to convert
+        cmd = ["ffmpeg", "-f", "wav", "-i", "pipe:0", "-f", output_format, "pipe:1"]
         
-        result = subprocess.run(cmd, capture_output=True, check=True)
+        result = subprocess.run(
+            cmd, 
+            input=audio_wav_bytes, 
+            capture_output=True, 
+            check=True
+        )
         return result.stdout
         
     except subprocess.CalledProcessError as e:
+        logger.error(f"Audio conversion failed: {e}")
         raise HTTPException(status_code=500, detail=f"Audio conversion failed: {e}")
 
 @app.post("/v1/audio/speech")
 async def create_speech(request: SpeechRequest):
     """
     OpenAI-compatible audio speech endpoint
-    Generates audio from text using Kyutai TTS
+    Uses cached TTS model for fast generation
     """
     try:
-        # Generate audio with Kyutai TTS
-        audio_path = generate_audio(
+        start_time = time.time()
+        
+        # Generate audio with cached model
+        audio_wav_bytes = generate_audio_fast(
             text=request.input,
-            voice=VOICE_MAPPING.get(request.voice, "default"),
+            voice=request.voice,
             speed=request.speed
         )
         
         # Convert to requested format
-        audio_data = convert_audio_format(audio_path, request.response_format)
+        audio_data = convert_audio_format(audio_wav_bytes, request.response_format)
+        
+        generation_time = time.time() - start_time
+        logger.info(f"⚡ Total generation time: {generation_time:.2f}s")
         
         # Set appropriate content type
         content_types = {
@@ -214,18 +225,17 @@ async def create_speech(request: SpeechRequest):
             "pcm": "audio/pcm"
         }
         
-        # Clean up temporary file
-        audio_path.unlink(missing_ok=True)
-        
         return Response(
             content=audio_data,
             media_type=content_types.get(request.response_format, "audio/wav"),
             headers={
-                "Content-Disposition": f"attachment; filename=speech.{request.response_format}"
+                "Content-Disposition": f"attachment; filename=speech.{request.response_format}",
+                "X-Generation-Time": str(generation_time)
             }
         )
         
     except Exception as e:
+        logger.error(f"Speech generation failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/v1/models")
@@ -257,12 +267,32 @@ async def list_models():
 
 @app.get("/health")
 async def health_check():
-    """Health check endpoint"""
+    """Health check endpoint with model status"""
+    model_loaded = tts_model is not None
     return {
-        "status": "healthy",
+        "status": "healthy" if model_loaded else "loading",
+        "model_loaded": model_loaded,
         "cuda_available": torch.cuda.is_available(),
-        "service": "kyutai-tts-openai-compatible"
+        "device": str(device) if device else None,
+        "service": "kyutai-tts-openai-compatible-cached"
     }
+
+@app.get("/reload-model")
+async def reload_model():
+    """Reload the TTS model (admin endpoint)"""
+    global tts_model
+    try:
+        tts_model = None
+        load_tts_model()
+        return {"status": "success", "message": "Model reloaded successfully"}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+@app.on_event("startup")
+async def startup_event():
+    """Load model on startup"""
+    logger.info("🚀 Starting TTS API server with model caching...")
+    load_tts_model()
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)
