@@ -24,6 +24,8 @@ A Docker-based OpenAI-compatible Text-to-Speech API server powered by Kyutai's T
 git clone https://github.com/dwain-barnes/kyutai-tts-openai-api.git
 cd kyutai-tts-openai-api
 
+mkdir input output cache scripts
+
 # Build and start
 docker compose build --no-cache
 docker compose up -d
