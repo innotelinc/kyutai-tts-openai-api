@@ -6,16 +6,16 @@ services:
       context: .
       dockerfile: Dockerfile
     image: kyutai-tts:latest
-    container_name: kyutai-tts-gpu
+    container_name: kyutai-tts-cpu
     
     # Enable GPU support
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: 1
-              capabilities: [gpu]
+    #deploy:
+    #  resources:
+    #    reservations:
+    #      devices:
+    #        - driver: nvidia
+    #          count: 1
+    #          capabilities: [gpu]
     
     # Alternative GPU configuration for older Docker Compose versions
     # runtime: nvidia
